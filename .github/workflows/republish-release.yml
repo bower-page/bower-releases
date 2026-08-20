@@ -1,0 +1,96 @@
+name: Republish a release under the bot
+
+# Re-creates an existing release so it is authored by github-actions rather than
+# by whichever person's token first published it. GitHub attributes a release to
+# the account whose credentials created it and offers no way to change that
+# afterwards, so the only route is to delete and re-create -- which is safe only
+# because everything needed is already in this repository.
+#
+# Assets are pulled from the release itself before it is deleted, using this
+# repository's own GITHUB_TOKEN. No personal access token is involved: a PAT
+# would put the release back under a human's name, which is the thing being
+# fixed.
+#
+# The checksum of every asset is taken before deletion and compared after
+# upload. A release that came back with different bytes than it went in with is
+# a failure, not a warning.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to republish (e.g. v0.5.6)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  republish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Read the release, and keep a copy of everything in it
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --json name,body,isPrerelease > release.json
+          jq -r .body release.json > body.md
+          jq -r .name release.json > title.txt
+
+          mkdir -p assets
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir assets --clobber
+
+          count=$(find assets -type f | wc -l)
+          if [ "$count" -eq 0 ]; then
+            echo "The release has no assets. Refusing to delete it."
+            exit 1
+          fi
+          echo "recovered $count asset(s):"
+          (cd assets && sha256sum * | tee ../before.sha256)
+
+      - name: Delete the release and its tag
+        # The tag goes too: it points at whatever commit the old release was cut
+        # from, and the new one is created against the default branch. Leaving a
+        # stale tag behind would make the two disagree.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
+
+      - name: Create it again, authored by the bot
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "$(cat title.txt)" \
+            --notes-file body.md \
+            assets/*
+
+      - name: Prove the bytes survived, and the byline changed
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          rm -rf verify && mkdir -p verify
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir verify --clobber
+          (cd verify && sha256sum -c ../before.sha256)
+          echo "every asset matches the checksum taken before deletion"
+
+          author=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json author -q .author.login)
+          echo "release author is now: $author"
+          case "$author" in
+            github-actions*) echo "ok" ;;
+            *) echo "still attributed to a person -- the point of this job was to stop that"; exit 1 ;;
+          esac
